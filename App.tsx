@@ -32,7 +32,10 @@ import {
   UserGroupIcon,
   UserMinusIcon,
   SunIcon,
-  MoonIcon
+  MoonIcon,
+  ChartBarSquareIcon,
+  MagnifyingGlassIcon,
+  ExclamationTriangleIcon
 } from '@heroicons/react/24/solid';
 
 // --- Helper for Date ---
@@ -51,7 +54,7 @@ const getPriceForLog = (customer: Customer, log: DeliveryLog): number => {
     return customer.prices[type] || 0;
 };
 
-// --- PDF Generator ---
+// --- PDF Generator for Statement ---
 const generateAndSavePDF = (
     customer: Customer, 
     logs: DeliveryLog[], 
@@ -273,6 +276,74 @@ const generateAndSavePDF = (
     doc.save(`Statement_${customer.name}_${new Date().toISOString().split('T')[0]}.pdf`);
 };
 
+// --- PDF Generator for Receipts Report ---
+const generateReceiptsPDF = (
+    payments: PaymentLog[], 
+    customers: Customer[], 
+    startDate: string, 
+    endDate: string
+) => {
+    const doc = new jsPDF();
+    
+    // Header
+    doc.setFillColor(46, 184, 114); // Primary Green
+    doc.rect(0, 0, 210, 30, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(20);
+    doc.setFont("helvetica", "bold");
+    doc.text("Kharjul Milk Service", 105, 15, { align: "center" });
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "normal");
+    doc.text(`Receipts Report (${formatDate(startDate)} - ${formatDate(endDate)})`, 105, 24, { align: "center" });
+
+    doc.setTextColor(0, 0, 0);
+    let yPos = 40;
+    
+    // Table Header
+    doc.setFillColor(240, 240, 240);
+    doc.rect(20, yPos, 170, 8, 'F');
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    doc.text("Date", 25, yPos + 6);
+    doc.text("Customer Name", 60, yPos + 6);
+    doc.text("Mode", 140, yPos + 6);
+    doc.text("Amount", 170, yPos + 6);
+    
+    yPos += 10;
+    doc.setFont("helvetica", "normal");
+
+    let totalCollected = 0;
+
+    payments.forEach(p => {
+        const c = customers.find(cust => cust.id === p.customerId);
+        totalCollected += p.amount;
+
+        doc.text(formatDate(p.date), 25, yPos);
+        doc.text(c?.name || "Unknown", 60, yPos);
+        doc.text(p.mode, 140, yPos);
+        doc.text(p.amount.toFixed(2), 170, yPos);
+        
+        doc.setDrawColor(230, 230, 230);
+        doc.line(20, yPos + 2, 190, yPos + 2);
+        
+        yPos += 8;
+
+        if (yPos > 280) {
+            doc.addPage();
+            yPos = 20;
+        }
+    });
+
+    // Total Footer
+    yPos += 5;
+    doc.setFont("helvetica", "bold");
+    doc.text("Total Collected:", 140, yPos);
+    doc.setTextColor(46, 184, 114);
+    doc.text(`Rs. ${totalCollected.toFixed(2)}`, 170, yPos);
+
+    doc.save(`Receipts_${startDate}_to_${endDate}.pdf`);
+};
+
 // --- Sub-Views ---
 
 const SplashScreen = ({ onFinish }: { onFinish: () => void }) => {
@@ -333,11 +404,13 @@ const LoginScreen = ({ onLogin }: { onLogin: (role: UserRole) => void }) => {
 const ProviderDashboard = ({ 
     customers, 
     logs,
+    payments,
     onBackup,
     onRestore
 }: { 
     customers: Customer[], 
     logs: DeliveryLog[],
+    payments: PaymentLog[],
     onBackup: () => void,
     onRestore: (e: React.ChangeEvent<HTMLInputElement>) => void
 }) => {
@@ -348,9 +421,10 @@ const ProviderDashboard = ({
     return customers.reduce((acc, c) => {
         const cLogs = logs.filter(l => l.customerId === c.id && l.status === DeliveryStatus.DELIVERED);
         const cVal = cLogs.reduce((sum, l) => sum + (l.quantity * (c.prices[l.milkType || c.milkType] || 0)), 0);
-        return acc + c.balance + cVal;
+        const cPaid = payments.filter(p => p.customerId === c.id).reduce((sum, p) => sum + p.amount, 0);
+        return acc + c.balance + cVal - cPaid;
     }, 0);
-  }, [customers, logs]);
+  }, [customers, logs, payments]);
 
   const deliveredCount = todayLogs.filter(l => l.status === DeliveryStatus.DELIVERED).length;
   // Count inactive customers for the dashboard card
@@ -572,6 +646,18 @@ const CustomerForm = ({
         <Button fullWidth onClick={handleSubmit} className="mb-3">
             {initialData ? 'Update Customer' : 'Add Customer'}
         </Button>
+        
+        {initialData && (
+             <Button 
+                variant="danger" 
+                fullWidth 
+                onClick={() => onDelete(initialData.id)}
+                className="mt-2"
+            >
+                <TrashIcon className="w-5 h-5"/> 
+                <span className="font-bold">Delete Customer</span>
+            </Button>
+        )}
       </Card>
     </div>
   );
@@ -584,6 +670,18 @@ const DailyDelivery = ({ customers, logs, onUpdateLog }: { customers: Customer[]
 
   const handleStatusChange = (customer: Customer, status: DeliveryStatus, customQty?: number, customMilkType?: MilkType) => {
     const existingLog = logs.find(l => l.customerId === customer.id && l.date === selectedDate);
+    
+    // Handle Unselecting / Toggling off
+    if (existingLog && existingLog.status === status && customQty === undefined && customMilkType === undefined) {
+        // If clicking the same status again (and not editing via modal), revert to Pending/Unselected
+        const newLog: DeliveryLog = {
+            ...existingLog,
+            status: DeliveryStatus.PENDING
+        };
+        onUpdateLog(newLog);
+        return;
+    }
+
     const quantity = customQty !== undefined ? customQty : (existingLog ? existingLog.quantity : customer.defaultQuantity);
     const milkType = customMilkType !== undefined ? customMilkType : (existingLog?.milkType || customer.milkType);
     
@@ -610,12 +708,53 @@ const DailyDelivery = ({ customers, logs, onUpdateLog }: { customers: Customer[]
   // Filter out Inactive customers (isPaused = true) AND filter by delivery time
   const activeCustomers = customers.filter(c => !c.isPaused && c.deliveryTime === selectedTime);
 
+  // Calculate Shift Stats (Remaining / Total)
+  const shiftStats = useMemo(() => {
+    const stats = {
+        [MilkType.COW]: { total: 0, delivered: 0 },
+        [MilkType.BUFFALO]: { total: 0, delivered: 0 }
+    };
+
+    // 1. Calculate Planned Total (Based on default settings of customers in this shift)
+    activeCustomers.forEach(c => {
+        if (stats[c.milkType]) {
+            stats[c.milkType].total += c.defaultQuantity;
+        }
+    });
+
+    // 2. Calculate Actual Delivered (Based on logs)
+    activeCustomers.forEach(c => {
+        const log = logs.find(l => l.customerId === c.id && l.date === selectedDate);
+        
+        // Only count towards consumption if status is DELIVERED
+        if (log && log.status === DeliveryStatus.DELIVERED) {
+            // Use the actual milk type used in the log (in case of override)
+            const type = log.milkType || c.milkType;
+            if (stats[type]) {
+                stats[type].delivered += log.quantity;
+            }
+        }
+    });
+
+    return {
+        [MilkType.COW]: { 
+            total: stats[MilkType.COW].total, 
+            remaining: stats[MilkType.COW].total - stats[MilkType.COW].delivered 
+        },
+        [MilkType.BUFFALO]: { 
+            total: stats[MilkType.BUFFALO].total, 
+            remaining: stats[MilkType.BUFFALO].total - stats[MilkType.BUFFALO].delivered 
+        }
+    };
+  }, [activeCustomers, logs, selectedDate]);
+
+
   // Sort: Pending first, then processed
   const sortedCustomers = [...activeCustomers].sort((a, b) => {
     const logA = logs.find(l => l.customerId === a.id && l.date === selectedDate);
     const logB = logs.find(l => l.customerId === b.id && l.date === selectedDate);
-    const statusA = logA ? 1 : 0;
-    const statusB = logB ? 1 : 0;
+    const statusA = (logA && logA.status !== DeliveryStatus.PENDING) ? 1 : 0;
+    const statusB = (logB && logB.status !== DeliveryStatus.PENDING) ? 1 : 0;
     return statusA - statusB;
   });
 
@@ -691,7 +830,25 @@ const DailyDelivery = ({ customers, logs, onUpdateLog }: { customers: Customer[]
           </div>
       </Card>
 
-      <div className="flex items-center justify-between mb-2 px-1">
+      {/* Milk Quantity Stats */}
+      <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white p-2 rounded-xl border border-blue-100 shadow-sm flex flex-col items-center">
+                 <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Cow (Rem/Total)</span>
+                 <div className="text-lg font-bold text-gray-800">
+                    <span className="text-blue-600">{shiftStats[MilkType.COW].remaining}</span>
+                    <span className="text-gray-400 text-sm"> / {shiftStats[MilkType.COW].total} L</span>
+                 </div>
+            </div>
+            <div className="bg-white p-2 rounded-xl border border-blue-100 shadow-sm flex flex-col items-center">
+                 <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Buffalo (Rem/Total)</span>
+                 <div className="text-lg font-bold text-gray-800">
+                    <span className="text-blue-600">{shiftStats[MilkType.BUFFALO].remaining}</span>
+                    <span className="text-gray-400 text-sm"> / {shiftStats[MilkType.BUFFALO].total} L</span>
+                 </div>
+            </div>
+      </div>
+
+      <div className="flex items-center justify-between mb-2 px-1 pt-2">
         <h2 className="text-lg font-bold text-gray-800">
            {selectedDate === getTodayStr() ? "Today's Route" : `Route for ${formatDate(selectedDate)}`}
         </h2>
@@ -705,7 +862,8 @@ const DailyDelivery = ({ customers, logs, onUpdateLog }: { customers: Customer[]
       ) : sortedCustomers.map(customer => {
         const log = logs.find(l => l.customerId === customer.id && l.date === selectedDate);
         const isDelivered = log?.status === DeliveryStatus.DELIVERED;
-        const isMissed = log?.status === DeliveryStatus.MISSED;
+        // Default visual state is Missed (Red) if not delivered.
+        const isMissed = !isDelivered;
         const currentQty = log ? log.quantity : customer.defaultQuantity;
         // Current delivery milk type or default customer milk type
         const currentMilkType = log?.milkType || customer.milkType;
@@ -751,394 +909,197 @@ const DailyDelivery = ({ customers, logs, onUpdateLog }: { customers: Customer[]
   );
 };
 
-const CustomerList = ({ 
-    customers, 
-    onAddClick,
-    onEditClick,
-    onDeleteClick,
-    onBackup
-}: { 
-    customers: Customer[], 
-    onAddClick: () => void, 
-    onEditClick: (c: Customer) => void,
-    onDeleteClick: (id: string) => void,
-    onBackup: () => void
-}) => {
-    const [deleteId, setDeleteId] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<'active' | 'inactive'>('active');
-
-    const confirmDelete = () => {
-        if (deleteId) {
-            onDeleteClick(deleteId);
-            setDeleteId(null);
-        }
-    }
-
-    const filteredCustomers = customers.filter(c => {
-        if (activeTab === 'active') return !c.isPaused;
-        return c.isPaused;
-    });
+const CustomerList = ({ customers, onEdit, onDelete, onAddNew }: { customers: Customer[], onEdit: (c: Customer) => void, onDelete: (id: string) => void, onAddNew: () => void }) => {
+    const [search, setSearch] = useState('');
+    const filtered = customers.filter(c => c.name.toLowerCase().includes(search.toLowerCase()) || c.mobile.includes(search));
 
     return (
         <div className="space-y-4">
-             <Modal 
-                isOpen={!!deleteId} 
-                onClose={() => setDeleteId(null)}
-                title="Confirm Deletion"
-            >
-                <div className="text-center">
-                    <p className="text-gray-600 mb-2">Are you sure you want to delete this customer?</p>
-                    <p className="text-xs text-red-500 font-bold mb-4">This action cannot be undone.</p>
-                    
-                    <div className="bg-blue-50 p-3 rounded-xl mb-6 border border-blue-100">
-                        <p className="text-xs text-blue-700 font-medium mb-2">It is recommended to backup data before deleting.</p>
-                        <Button variant="outline" fullWidth onClick={onBackup} className="!py-2 text-xs bg-white border-blue-200 text-blue-700">
-                            <ArrowDownTrayIcon className="w-3 h-3 mr-1"/> Backup Data
-                        </Button>
-                    </div>
-
-                    <div className="flex gap-3">
-                        <Button variant="outline" fullWidth onClick={() => setDeleteId(null)}>Cancel</Button>
-                        <Button variant="danger" fullWidth onClick={confirmDelete}>Delete</Button>
+             <div className="flex gap-2">
+                <div className="relative flex-1">
+                    <input 
+                        className="w-full pl-10 pr-4 py-2 rounded-xl border border-gray-200 outline-none focus:border-primary"
+                        placeholder="Search customers..."
+                        value={search}
+                        onChange={e => setSearch(e.target.value)}
+                    />
+                    <div className="absolute left-3 top-2.5 text-gray-400">
+                        <MagnifyingGlassIcon className="w-5 h-5" />
                     </div>
                 </div>
-            </Modal>
-
-             <div className="flex justify-between items-center mb-2">
-                <h2 className="text-lg font-bold text-gray-800">My Customers</h2>
-                <Button onClick={onAddClick} className="!py-2 !px-4 text-sm">
-                    <PlusIcon className="w-4 h-4 mr-1"/> Add
-                </Button>
-            </div>
-
-            {/* Tabs */}
-            <div className="flex p-1 bg-gray-100 rounded-xl">
-                <button 
-                    onClick={() => setActiveTab('active')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'active' ? 'bg-white text-primary shadow-sm' : 'text-gray-500'}`}
-                >
-                    <div className="flex items-center justify-center gap-2">
-                        <UserGroupIcon className="w-4 h-4" />
-                        Active
-                    </div>
-                </button>
-                <button 
-                    onClick={() => setActiveTab('inactive')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'inactive' ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500'}`}
-                >
-                    <div className="flex items-center justify-center gap-2">
-                        <UserMinusIcon className="w-4 h-4" />
-                        Inactive
-                    </div>
-                </button>
-            </div>
-
-            {filteredCustomers.length === 0 ? (
-                <div className="text-center py-10 text-gray-400">
-                    <p>No {activeTab} customers.</p>
-                </div>
-            ) : (
-                filteredCustomers.map(c => (
-                    <Card key={c.id}>
-                        <div className="flex justify-between items-center mb-2">
-                            <div className="flex gap-3 items-center">
-                                <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold ${c.isPaused ? 'bg-gray-200 text-gray-500' : 'bg-secondary/20 text-secondary-800'}`}>
-                                    {c.name.charAt(0)}
-                                </div>
-                                <div>
-                                    <p className="font-bold text-sm">{c.name}</p>
-                                    <p className="text-xs text-gray-500">{c.mobile}</p>
-                                </div>
-                            </div>
-                            <div className="text-right">
-                                <p className="font-bold text-sm">₹{c.balance}</p>
-                                <p className="text-[10px] text-gray-400">Prev. Due</p>
-                            </div>
-                        </div>
-                        <div className="flex gap-2 border-t border-gray-50 pt-2 mt-2 justify-end">
-                            <button 
-                                onClick={(e) => { e.stopPropagation(); onEditClick(c); }}
-                                className="text-xs font-medium text-gray-600 flex items-center gap-1 hover:text-primary transition-colors px-2 py-1 rounded-md hover:bg-gray-50"
-                            >
-                                <PencilSquareIcon className="w-4 h-4" /> Edit
-                            </button>
-                            <button 
-                                type="button"
-                                onClick={(e) => { 
-                                    e.stopPropagation(); 
-                                    setDeleteId(c.id);
-                                }}
-                                className="text-xs font-medium text-red-500 flex items-center gap-1 hover:text-red-600 transition-colors px-2 py-1 rounded-md hover:bg-red-50 cursor-pointer z-10"
-                            >
-                                <TrashIcon className="w-4 h-4" /> Delete
-                            </button>
-                        </div>
-                    </Card>
-                ))
-            )}
+                <Button onClick={onAddNew} className="!px-4"><PlusIcon className="w-5 h-5"/></Button>
+             </div>
+             
+             {filtered.map(c => (
+                 <Card key={c.id} onClick={() => onEdit(c)}>
+                     <div className="flex justify-between items-start">
+                         <div>
+                             <h4 className="font-bold text-gray-800">{c.name}</h4>
+                             <p className="text-xs text-gray-500">{c.mobile}</p>
+                             <p className="text-xs text-gray-500 mt-1">{c.address}</p>
+                         </div>
+                         <div className="text-right">
+                             <Badge status={c.isPaused ? 'Paused' : 'Active'} />
+                             <p className="text-xs font-bold text-primary mt-2">{c.defaultQuantity} L / day</p>
+                         </div>
+                     </div>
+                 </Card>
+             ))}
         </div>
     )
-}
+};
 
-const BillingView = ({ 
-    customers, 
-    logs, 
-    paymentLogs, 
-    onAddPayment 
-}: { 
-    customers: Customer[], 
-    logs: DeliveryLog[], 
-    paymentLogs: PaymentLog[],
-    onAddPayment: (c: Customer, amount: number, mode: PaymentMode, date: string) => void 
-}) => {
+const BillingView = ({ customers, logs, payments, onAddPayment }: { customers: Customer[], logs: DeliveryLog[], payments: PaymentLog[], onAddPayment: (p: PaymentLog) => void }) => {
     const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
-    const [amount, setAmount] = useState('');
+    const [paymentAmount, setPaymentAmount] = useState('');
     const [paymentDate, setPaymentDate] = useState(getTodayStr());
     const [paymentMode, setPaymentMode] = useState<PaymentMode>(PaymentMode.CASH);
     
-    const currentMonthStart = getFirstDayOfMonth();
-    const currentMonthEnd = getTodayStr();
+    // Helper to calculate total due for a customer based on logs
+    const calculateDue = (c: Customer) => {
+        const cLogs = logs.filter(l => l.customerId === c.id && l.status === DeliveryStatus.DELIVERED);
+        const billAmount = cLogs.reduce((sum, l) => sum + (l.quantity * (c.prices[l.milkType || c.milkType] || 0)), 0);
+        const cPayments = payments.filter(p => p.customerId === c.id);
+        const paidAmount = cPayments.reduce((sum, p) => sum + p.amount, 0);
+        return c.balance + billAmount - paidAmount;
+    }
 
-    // Helper to calc totals for UI display (current month)
-    const calculateMonthTotal = (customer: Customer) => {
-        const relevantLogs = logs.filter(l => 
-            l.customerId === customer.id && 
-            l.date >= currentMonthStart &&
-            l.date <= currentMonthEnd &&
-            l.status === DeliveryStatus.DELIVERED
-        );
-        const totalLitres = relevantLogs.reduce((acc, l) => acc + l.quantity, 0);
-        const total = relevantLogs.reduce((acc, l) => {
-             const type = l.milkType || customer.milkType;
-             const price = customer.prices[type] || 0;
-             return acc + (l.quantity * price);
-        }, 0);
-        return { totalLitres, total };
-    };
-    
-    const handlePaymentSubmit = () => {
-        if (selectedCustomer && amount) {
-            onAddPayment(selectedCustomer, parseFloat(amount), paymentMode, paymentDate);
-            setSelectedCustomer(null);
-            setAmount('');
-            setPaymentMode(PaymentMode.CASH);
-            setPaymentDate(getTodayStr());
-            alert("Payment recorded successfully!");
-        }
-    };
-
-    const handleGeneratePdf = (c: Customer) => {
-        // Calculate Opening Balance for "All Time" Statement
-        // Opening = Current Balance + Sum(All Payments)
-        // (This formula works because Current Balance = Initial Debt - All Payments)
-        // So Opening = Initial Debt.
-        const allPayments = paymentLogs.filter(p => p.customerId === c.id);
-        const totalPayments = allPayments.reduce((sum, p) => sum + p.amount, 0);
-        const openingBalance = c.balance + totalPayments;
-
-        generateAndSavePDF(c, logs, paymentLogs, "Statement", openingBalance);
+    const handlePayment = () => {
+        if(!selectedCustomer || !paymentAmount) return;
+        onAddPayment({
+            id: Date.now().toString(),
+            customerId: selectedCustomer.id,
+            date: paymentDate,
+            amount: parseFloat(paymentAmount),
+            mode: paymentMode
+        });
+        setPaymentAmount('');
+        setPaymentDate(getTodayStr());
+        setSelectedCustomer(null);
     };
 
     return (
         <div className="space-y-4">
-             {selectedCustomer && (
-                <Modal 
-                    isOpen={true} 
-                    onClose={() => setSelectedCustomer(null)}
-                    title="Add Receipt"
-                >
-                    <div className="space-y-3">
-                        <p className="text-sm text-gray-500 mb-2">Recording payment from <span className="font-bold text-gray-800">{selectedCustomer.name}</span></p>
-                        
-                        <Input 
-                            label="Date"
-                            type="date"
-                            value={paymentDate}
-                            onChange={e => setPaymentDate(e.target.value)}
-                        />
-
-                        <Input 
-                            label="Amount (₹)" 
-                            type="number" 
-                            value={amount} 
-                            onChange={e => setAmount(e.target.value)}
-                            placeholder="Enter amount"
-                        />
-                        
-                        <Select
-                            label="Payment Mode"
-                            options={[
-                                { label: 'Cash', value: PaymentMode.CASH },
-                                { label: 'UPI / Online', value: PaymentMode.ONLINE }
-                            ]}
-                            value={paymentMode}
-                            onChange={(e) => setPaymentMode(e.target.value as PaymentMode)}
-                        />
-
-                        <div className="flex gap-3 mt-4">
-                            <Button variant="outline" fullWidth onClick={() => setSelectedCustomer(null)}>Cancel</Button>
-                            <Button fullWidth onClick={handlePaymentSubmit}>Save</Button>
-                        </div>
+            {selectedCustomer && (
+                <Modal isOpen={true} onClose={() => setSelectedCustomer(null)} title="Record Payment">
+                    <div className="space-y-4">
+                        <p className="text-sm text-gray-600">Collecting payment from <span className="font-bold">{selectedCustomer.name}</span></p>
+                        <Input label="Date" type="date" value={paymentDate} onChange={e => setPaymentDate(e.target.value)} />
+                        <Input label="Amount (₹)" type="number" value={paymentAmount} onChange={e => setPaymentAmount(e.target.value)} autoFocus />
+                        <Select label="Mode" options={[{label: 'Cash', value: 'Cash'}, {label: 'Online', value: 'Online'}]} value={paymentMode} onChange={e => setPaymentMode(e.target.value as PaymentMode)} />
+                        <Button fullWidth onClick={handlePayment}>Save Payment</Button>
                     </div>
                 </Modal>
             )}
 
-            <div className="flex justify-between items-center bg-white p-3 rounded-xl shadow-sm">
-                <span className="text-gray-600 font-medium">Month</span>
-                <span className="font-bold text-primary">Current Month</span>
-            </div>
-
             {customers.map(c => {
-                const { totalLitres, total } = calculateMonthTotal(c);
-                const defaultPrice = c.prices[c.milkType];
-                const netPayable = c.balance + total;
-
+                const due = calculateDue(c);
                 return (
-                    <Card key={c.id}>
-                        <div className="flex justify-between border-b border-gray-100 pb-2 mb-2">
-                            <h4 className="font-bold">{c.name}</h4>
-                            <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">Active</span>
-                        </div>
-                        <div className="grid grid-cols-3 gap-2 text-center mb-3">
+                    <Card key={c.id} className="flex flex-col gap-3">
+                        <div className="flex justify-between items-start">
                             <div>
-                                <p className="text-xs text-gray-400">Litres</p>
-                                <p className="font-semibold text-sm">{totalLitres}L</p>
+                                <h4 className="font-bold text-gray-800">{c.name}</h4>
+                                <p className="text-sm font-bold text-red-500">Due: ₹{due.toFixed(2)}</p>
                             </div>
-                            <div>
-                                <p className="text-xs text-gray-400">Base Rate</p>
-                                <p className="font-semibold text-sm">₹{defaultPrice}</p>
-                            </div>
-                            <div>
-                                <p className="text-xs text-gray-400">Month Bill</p>
-                                <p className="font-bold text-primary">₹{total}</p>
-                            </div>
+                            <button onClick={() => setSelectedCustomer(c)} className="bg-primary/10 text-primary p-2 rounded-lg hover:bg-primary/20">
+                                <BanknotesIcon className="w-5 h-5"/>
+                            </button>
                         </div>
-                        <div className="flex justify-between items-center bg-gray-50 px-3 py-2 rounded-lg mb-3">
-                                <div className="text-left">
-                                    <span className="block text-[10px] text-gray-500">Prev. Due</span>
-                                    <span className="text-sm font-semibold">₹{c.balance}</span>
-                                </div>
-                                <div className="text-right">
-                                    <span className="block text-[10px] text-gray-500">Net Receivable</span>
-                                    <span className="text-lg font-bold text-gray-800">₹{netPayable}</span>
-                                </div>
-                        </div>
-                        <div className="flex flex-col gap-2">
-                            <div className="flex gap-2">
-                                <Button variant="outline" className="flex-1 !py-2 text-xs" onClick={() => handleGeneratePdf(c)}>
-                                    <ArrowDownTrayIcon className="w-4 h-4 mr-1"/> PDF
+                        <div className="flex gap-2">
+                             <Button variant="outline" className="flex-1 !py-2 text-xs" onClick={() => generateAndSavePDF(c, logs, payments, "Statement", c.balance)}>
+                                <DocumentTextIcon className="w-4 h-4"/> Statement
+                             </Button>
+                             <a href={`https://wa.me/91${c.mobile}?text=Hello ${c.name}, your current outstanding milk bill is Rs. ${due.toFixed(2)}. Please pay at your earliest convenience.`} target="_blank" rel="noreferrer" className="flex-1">
+                                <Button variant="secondary" className="w-full !py-2 text-xs">
+                                    <PhoneIcon className="w-4 h-4"/> WhatsApp
                                 </Button>
-                                <Button className="flex-1 !py-2 text-xs" onClick={() => {
-                                    setPaymentDate(getTodayStr());
-                                    setSelectedCustomer(c);
-                                }}>
-                                    <DocumentTextIcon className="w-4 h-4 mr-1" /> Receipt
-                                </Button>
-                            </div>
+                             </a>
                         </div>
                     </Card>
                 );
             })}
         </div>
-    )
-}
+    );
+};
 
 const ReportsView = ({ 
     customers, 
-    logs, 
-    paymentLogs 
+    payments, 
+    onUpdatePayment,
+    onDeletePayment 
 }: { 
     customers: Customer[], 
-    logs: DeliveryLog[], 
-    paymentLogs: PaymentLog[] 
+    payments: PaymentLog[],
+    onUpdatePayment: (p: PaymentLog) => void,
+    onDeletePayment: (id: string) => void
 }) => {
+    const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
     const [startDate, setStartDate] = useState(getFirstDayOfMonth());
     const [endDate, setEndDate] = useState(getTodayStr());
-    const [milkTypeFilter, setMilkTypeFilter] = useState<string>('All');
+    const [editingPayment, setEditingPayment] = useState<PaymentLog | null>(null);
 
-    const calculateTotalForRange = (customer: Customer) => {
-        const relevantLogs = logs.filter(l => 
-            l.customerId === customer.id && 
-            l.date >= startDate &&
-            l.date <= endDate &&
-            l.status === DeliveryStatus.DELIVERED
-        );
-        const totalLitres = relevantLogs.reduce((acc, l) => acc + l.quantity, 0);
-        const total = relevantLogs.reduce((acc, l) => {
-             const type = l.milkType || customer.milkType;
-             const price = customer.prices[type] || 0;
-             return acc + (l.quantity * price);
-        }, 0);
-        
-        return { totalLitres, total, relevantLogs };
-    };
+    const filteredPayments = payments.filter(p => {
+        if (selectedCustomerId && p.customerId !== selectedCustomerId) return false;
+        if (p.date < startDate || p.date > endDate) return false;
+        return true;
+    }).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    const handleGenerateReport = (customer: Customer) => {
-        const { relevantLogs } = calculateTotalForRange(customer);
-        const relevantPayments = paymentLogs.filter(p => 
-            p.customerId === customer.id &&
-            p.date >= startDate &&
-            p.date <= endDate
-        );
+    const totalPaid = filteredPayments.reduce((acc, curr) => acc + curr.amount, 0);
 
-        if (relevantLogs.length === 0 && relevantPayments.length === 0) {
-            alert('No transactions found for this customer in the selected date range.');
-            return;
+    const handleEditSave = () => {
+        if (editingPayment) {
+            onUpdatePayment(editingPayment);
+            setEditingPayment(null);
         }
-
-        // Calculate Opening Balance for Range
-        // Logic: 
-        // 1. Calculate Value of ALL delivered logs for this customer (ever).
-        // 2. Calculate Value of delivered logs SINCE startDate (including range and future).
-        // 3. Deliveries BEFORE start = All - SinceStart.
-        // 4. Calculate Payments SINCE startDate.
-        // 5. Opening = Customer.balance + PaymentsSinceStart + DeliveriesBeforeStart.
-        
-        // Helper to value logs
-        const calcLogVal = (l: DeliveryLog) => l.quantity * (customer.prices[l.milkType || customer.milkType] || 0);
-        
-        // 1. All Delivered Value
-        const allDeliveredLogs = logs.filter(l => l.customerId === customer.id && l.status === DeliveryStatus.DELIVERED);
-        const allDeliveredValue = allDeliveredLogs.reduce((sum, l) => sum + calcLogVal(l), 0);
-
-        // 2. Deliveries Since Start
-        const logsSinceStart = allDeliveredLogs.filter(l => l.date >= startDate);
-        const valSinceStart = logsSinceStart.reduce((sum, l) => sum + calcLogVal(l), 0);
-
-        // 3. Deliveries Before Start
-        const valBeforeStart = allDeliveredValue - valSinceStart;
-
-        // 4. Payments Since Start
-        const paymentsSinceStart = paymentLogs.filter(p => p.customerId === customer.id && p.date >= startDate);
-        const paymentsSinceStartVal = paymentsSinceStart.reduce((sum, p) => sum + p.amount, 0);
-
-        // 5. Opening
-        const openingBalance = customer.balance + paymentsSinceStartVal + valBeforeStart;
-
-        generateAndSavePDF(customer, relevantLogs, relevantPayments, `Bill: ${formatDate(startDate)} - ${formatDate(endDate)}`, openingBalance);
-    };
-
-    const filteredCustomers = customers.filter(c => 
-        milkTypeFilter === 'All' || c.milkType === milkTypeFilter
-    );
-
-    // Calculate Grand Totals
-    const grandTotals = filteredCustomers.reduce((acc, c) => {
-        const stats = calculateTotalForRange(c);
-        return {
-            litres: acc.litres + stats.totalLitres,
-            amount: acc.amount + stats.total
-        };
-    }, { litres: 0, amount: 0 });
+    }
 
     return (
         <div className="space-y-4">
-             <Card className="bg-primary/5 border-primary/20">
-                <h3 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
-                    <CalendarDaysIcon className="w-5 h-5 text-primary"/> Report Settings
-                </h3>
+             {editingPayment && (
+                <Modal 
+                    isOpen={true} 
+                    onClose={() => setEditingPayment(null)}
+                    title="Edit Receipt"
+                >
+                    <div className="space-y-3">
+                        <Input 
+                            label="Date"
+                            type="date"
+                            value={editingPayment.date}
+                            onChange={e => setEditingPayment({...editingPayment, date: e.target.value})}
+                        />
+                        <Input 
+                            label="Amount (₹)" 
+                            type="number" 
+                            value={editingPayment.amount} 
+                            onChange={e => setEditingPayment({...editingPayment, amount: parseFloat(e.target.value)})}
+                        />
+                        <Select
+                            label="Mode"
+                            options={[
+                                { label: 'Cash', value: PaymentMode.CASH },
+                                { label: 'Online', value: 'Online' }
+                            ]}
+                            value={editingPayment.mode}
+                            onChange={(e) => setEditingPayment({...editingPayment, mode: e.target.value as PaymentMode})}
+                        />
+                        <Button fullWidth onClick={handleEditSave}>Save Changes</Button>
+                    </div>
+                </Modal>
+            )}
+
+            <Card className="bg-white">
                 <div className="space-y-4">
-                    <div className="grid grid-cols-2 gap-4">
+                    <Select 
+                        label="Customer"
+                        value={selectedCustomerId}
+                        onChange={(e) => setSelectedCustomerId(e.target.value)}
+                        options={[
+                            { label: 'All Customers', value: '' },
+                            ...customers.map(c => ({ label: c.name, value: c.id }))
+                        ]}
+                    />
+                    <div className="grid grid-cols-2 gap-3">
                         <Input 
                             label="Start Date" 
                             type="date" 
@@ -1153,269 +1114,262 @@ const ReportsView = ({
                             onChange={(e) => setEndDate(e.target.value)} 
                         />
                     </div>
-                    <Select 
-                        label="Filter by Milk Type"
-                        value={milkTypeFilter}
-                        onChange={(e) => setMilkTypeFilter(e.target.value)}
-                        options={[
-                            { label: 'All Types', value: 'All' },
-                            { label: 'Cow', value: MilkType.COW },
-                            { label: 'Buffalo', value: MilkType.BUFFALO },
-                        ]}
-                    />
+                    <Button 
+                        fullWidth 
+                        onClick={() => generateReceiptsPDF(filteredPayments, customers, startDate, endDate)}
+                        className="!mt-2"
+                    >
+                        <ArrowDownTrayIcon className="w-5 h-5" /> Download Report (PDF)
+                    </Button>
                 </div>
             </Card>
 
-            {/* Total Summary Card */}
-            <Card className="bg-white border border-gray-200 shadow-sm">
-                 <h4 className="text-sm font-semibold text-gray-500 mb-2 uppercase tracking-wide">Total Summary</h4>
-                 <div className="flex justify-between items-center">
-                    <div>
-                        <p className="text-xs text-gray-400">Total Litres</p>
-                        <p className="text-2xl font-bold text-primary">{grandTotals.litres.toFixed(2)} L</p>
-                    </div>
-                    <div className="text-right">
-                        <p className="text-xs text-gray-400">Total Amount</p>
-                        <p className="text-2xl font-bold text-gray-800">₹{grandTotals.amount.toFixed(2)}</p>
-                    </div>
-                 </div>
-            </Card>
-
-            <div className="flex justify-between items-center mt-2">
-                 <h3 className="font-heading font-semibold text-lg text-gray-800">
-                    Customer Reports ({filteredCustomers.length})
-                 </h3>
+            <div className="flex justify-between items-center bg-green-50 p-3 rounded-xl border border-green-100">
+               <span className="text-sm font-bold text-green-800">Total Collected</span>
+               <span className="text-lg font-bold text-green-600">₹{totalPaid}</span>
             </div>
 
-            {filteredCustomers.length === 0 ? (
-                <div className="text-center py-8 text-gray-400">
-                    No customers found for selected criteria.
-                </div>
-            ) : (
-                filteredCustomers.map(c => {
-                    const { totalLitres, total } = calculateTotalForRange(c);
-                    
-                    return (
-                        <Card key={c.id} className="flex flex-col gap-2">
-                            <div className="flex justify-between items-start">
+            <div className="space-y-2">
+                <h3 className="font-bold text-gray-700">Receipts History</h3>
+                {filteredPayments.length === 0 ? (
+                    <div className="text-center py-8 text-gray-400">No receipts found.</div>
+                ) : (
+                    filteredPayments.map(p => {
+                        const c = customers.find(cust => cust.id === p.customerId);
+                        return (
+                            <Card key={p.id} className="flex justify-between items-center relative">
                                 <div>
-                                    <h4 className="font-bold text-gray-800">{c.name}</h4>
-                                    <p className="text-xs text-gray-500">
-                                        {c.milkType} • {totalLitres} Litres • ₹{total} Total
-                                    </p>
+                                    <p className="font-bold text-gray-800">{c?.name || 'Unknown'}</p>
+                                    <p className="text-xs text-gray-500">{formatDate(p.date)} • {p.mode}</p>
                                 </div>
-                                <Button 
-                                    variant="outline" 
-                                    className="!py-1 !px-3 text-xs" 
-                                    onClick={() => handleGenerateReport(c)}
-                                >
-                                    <ArrowDownTrayIcon className="w-4 h-4 mr-1"/> Download
-                                </Button>
-                            </div>
-                        </Card>
-                    );
-                })
-            )}
+                                <div className="flex items-center gap-3">
+                                    <span className="font-bold text-green-600">+₹{p.amount}</span>
+                                    <div className="flex gap-1">
+                                        <button 
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                setEditingPayment(p);
+                                            }}
+                                            className="p-2 bg-gray-100 rounded-lg text-gray-600 hover:text-primary z-10"
+                                        >
+                                            <PencilSquareIcon className="w-5 h-5"/>
+                                        </button>
+                                        <button 
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                onDeletePayment(p.id);
+                                            }}
+                                            className="p-2 bg-red-50 rounded-lg text-red-500 hover:bg-red-100 z-10"
+                                        >
+                                            <TrashIcon className="w-5 h-5"/>
+                                        </button>
+                                    </div>
+                                </div>
+                            </Card>
+                        )
+                    })
+                )}
+            </div>
         </div>
     );
 };
 
-// --- Main App Orchestrator ---
-
 const App = () => {
-  const [isLoading, setIsLoading] = useState(true);
-  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState<User | null>(null); // In real app, persist this
+  const [view, setView] = useState('dashboard');
   const [customers, setCustomers] = useState<Customer[]>(MOCK_CUSTOMERS);
-  const [deliveryLogs, setDeliveryLogs] = useState<DeliveryLog[]>([]);
-  const [paymentLogs, setPaymentLogs] = useState<PaymentLog[]>([]);
-  const [currentView, setCurrentView] = useState('dashboard');
-  const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
+  const [logs, setLogs] = useState<DeliveryLog[]>([]);
+  const [payments, setPayments] = useState<PaymentLog[]>([]);
   
-  // Fake persistent data load
+  // Modal States
+  const [showCustomerForm, setShowCustomerForm] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState<Customer | undefined>(undefined);
+  
+  // Delete Confirmation State
+  const [confirmModal, setConfirmModal] = useState<{
+      isOpen: boolean;
+      title: string;
+      message: string;
+      onConfirm: () => void;
+  }>({ isOpen: false, title: '', message: '', onConfirm: () => {} });
+
+  const closeConfirm = () => setConfirmModal(prev => ({ ...prev, isOpen: false }));
+
   useEffect(() => {
-    // Generate logs on load for demo purposes
-    setDeliveryLogs(generateMockLogs());
+      // Simulate data fetching
+      const loadedLogs = generateMockLogs();
+      setLogs(loadedLogs);
+      // setPayments([]); // Already empty
   }, []);
 
   const handleLogin = (role: UserRole) => {
-    // Simulate user creation with hardcoded mobile/id since mobile input is removed
-    const newUser: User = {
-      id: 'provider-admin',
-      mobile: 'ADMIN',
-      role,
-    };
-    setUser(newUser);
-    setCurrentView('dashboard');
-  };
-
-  const handleLogout = () => {
-    setUser(null);
-    setCurrentView('login');
-  };
-
-  const updateDeliveryLog = (newLog: DeliveryLog) => {
-    setDeliveryLogs(prev => {
-      const idx = prev.findIndex(l => l.id === newLog.id);
-      let updatedLogs = [...prev];
-      if (idx >= 0) {
-        updatedLogs[idx] = newLog;
-      } else {
-        updatedLogs.push(newLog);
-      }
-      return updatedLogs;
-    });
-  };
-
-  const handleDeleteCustomer = (id: string) => {
-    setCustomers(prev => prev.filter(c => c.id !== id));
-  };
-
-  const handleAddPayment = (customer: Customer, amount: number, mode: PaymentMode, date: string) => {
-      // 1. Add Payment Log
-      const newPayment: PaymentLog = {
-          id: `pay-${Date.now()}`,
-          customerId: customer.id,
-          date: date,
-          amount: amount,
-          mode: mode
-      };
-      setPaymentLogs(prev => [...prev, newPayment]);
-
-      // 2. Update Customer Balance
-      // Deduct the amount from the customer's balance (Due)
-      setCustomers(prev => prev.map(c => {
-          if (c.id === customer.id) {
-              return { ...c, balance: c.balance - amount };
-          }
-          return c;
-      }));
+      setUser({ id: '1', mobile: '0000', role });
+      setLoading(false);
   };
 
   const handleBackup = () => {
-    const data = {
-        customers,
-        deliveryLogs,
-        paymentLogs,
-        backupDate: new Date().toISOString()
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `milk_daily_backup_${getTodayStr()}.json`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+      const data = { customers, logs, payments };
+      const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `backup_${getTodayStr()}.json`;
+      a.click();
   };
 
-  const handleRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    
-    const reader = new FileReader();
-    reader.onload = (e) => {
-        try {
-            const data = JSON.parse(e.target?.result as string);
-            if (data.customers && data.deliveryLogs) {
-                if(window.confirm('This will overwrite all current data. Are you sure?')) {
-                    setCustomers(data.customers);
-                    setDeliveryLogs(data.deliveryLogs);
-                    setPaymentLogs(data.paymentLogs || []);
-                    alert('Data restored successfully!');
-                }
-            } else {
-                alert('Invalid backup file. Missing customers or logs.');
-            }
-        } catch (err) {
-            alert('Error reading backup file');
-            console.error(err);
+  const handleRestore = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+              try {
+                  const data = JSON.parse(event.target?.result as string);
+                  if (data.customers) setCustomers(data.customers);
+                  if (data.logs) setLogs(data.logs);
+                  if (data.payments) setPayments(data.payments);
+                  alert('Data restored successfully!');
+              } catch (err) {
+                  alert('Invalid backup file');
+              }
+          };
+          reader.readAsText(file);
+      }
+  };
+
+  // --- Payment State Handlers ---
+  const handleUpdatePayment = (updatedPayment: PaymentLog) => {
+      setPayments(prev => prev.map(p => p.id === updatedPayment.id ? updatedPayment : p));
+  };
+
+  const handleDeletePayment = (id: string) => {
+      setConfirmModal({
+        isOpen: true,
+        title: 'Delete Receipt',
+        message: 'Have you taken a backup? Deleting this receipt is permanent and cannot be undone.',
+        onConfirm: () => {
+             setPayments(prev => prev.filter(p => p.id !== id));
+             closeConfirm();
         }
-        // Reset input
-        event.target.value = '';
-    };
-    reader.readAsText(file);
+      });
   };
 
-  if (isLoading) return <SplashScreen onFinish={() => setIsLoading(false)} />;
+  if (loading) return <SplashScreen onFinish={() => setLoading(false)} />;
   if (!user) return <LoginScreen onLogin={handleLogin} />;
 
-  // View Routing Logic
-  let content;
-  let title = "Kharjul Milk Service";
-
-  // Only Provider Views are supported now
-    switch (currentView) {
-      case 'dashboard':
-        title = "Dashboard";
-        content = <ProviderDashboard 
-            customers={customers} 
-            logs={deliveryLogs} 
-            onBackup={handleBackup}
-            onRestore={handleRestore}
-        />;
-        break;
-      case 'daily-delivery':
-        title = "Today's Route";
-        content = <DailyDelivery customers={customers} logs={deliveryLogs} onUpdateLog={updateDeliveryLog} />;
-        break;
-      case 'customers':
-        title = "Customers";
-        content = <CustomerList 
-            customers={customers} 
-            onAddClick={() => {
-                setEditingCustomer(null);
-                setCurrentView('customer-form');
-            }}
-            onEditClick={(c) => {
-                setEditingCustomer(c);
-                setCurrentView('customer-form');
-            }}
-            onDeleteClick={handleDeleteCustomer}
-            onBackup={handleBackup}
-        />;
-        break;
-      case 'customer-form':
-        title = editingCustomer ? "Edit Customer" : "Add Customer";
-        content = <CustomerForm 
-            initialData={editingCustomer || undefined}
-            onCancel={() => setCurrentView('customers')} 
-            onSave={(c) => {
-                if (editingCustomer) {
-                    setCustomers(customers.map(cust => cust.id === c.id ? c : cust));
-                } else {
-                    setCustomers([...customers, c]);
-                }
-                setCurrentView('customers');
-            }} 
-            onDelete={handleDeleteCustomer}
-        />;
-        break;
-      case 'billing':
-        title = "Billing";
-        content = <BillingView customers={customers} logs={deliveryLogs} paymentLogs={paymentLogs} onAddPayment={handleAddPayment} />;
-        break;
-      case 'reports':
-        title = "Reports";
-        content = <ReportsView customers={customers} logs={deliveryLogs} paymentLogs={paymentLogs} />;
-        break;
-      default:
-        content = <ProviderDashboard 
-            customers={customers} 
-            logs={deliveryLogs} 
-            onBackup={handleBackup}
-            onRestore={handleRestore}
-        />;
-    }
+  const renderContent = () => {
+      switch (view) {
+          case 'dashboard':
+              return <ProviderDashboard customers={customers} logs={logs} payments={payments} onBackup={handleBackup} onRestore={handleRestore} />;
+          case 'daily-delivery':
+              return <DailyDelivery customers={customers} logs={logs} onUpdateLog={(newLog) => {
+                  setLogs(prev => {
+                      const idx = prev.findIndex(l => l.id === newLog.id);
+                      if (idx >= 0) {
+                          const updated = [...prev];
+                          updated[idx] = newLog;
+                          return updated;
+                      }
+                      return [...prev, newLog];
+                  });
+              }} />;
+          case 'customers':
+              if (showCustomerForm) {
+                  return <CustomerForm 
+                      initialData={editingCustomer} 
+                      onCancel={() => { setShowCustomerForm(false); setEditingCustomer(undefined); }}
+                      onSave={(c) => {
+                          setCustomers(prev => {
+                              const exists = prev.find(cust => cust.id === c.id);
+                              if (exists) return prev.map(cust => cust.id === c.id ? c : cust);
+                              return [...prev, c];
+                          });
+                          setShowCustomerForm(false);
+                          setEditingCustomer(undefined);
+                      }}
+                      onDelete={(id) => {
+                           setConfirmModal({
+                               isOpen: true,
+                               title: 'Delete Customer',
+                               message: 'Have you taken a backup? This will delete the customer and cannot be undone.',
+                               onConfirm: () => {
+                                   setCustomers(prev => prev.filter(c => c.id !== id));
+                                   setShowCustomerForm(false);
+                                   setEditingCustomer(undefined);
+                                   closeConfirm();
+                               }
+                           });
+                      }}
+                  />;
+              }
+              return <CustomerList 
+                  customers={customers} 
+                  onAddNew={() => { setEditingCustomer(undefined); setShowCustomerForm(true); }}
+                  onEdit={(c) => { setEditingCustomer(c); setShowCustomerForm(true); }}
+                  onDelete={(id) => setCustomers(prev => prev.filter(c => c.id !== id))}
+              />;
+          case 'billing':
+              return <BillingView 
+                  customers={customers} 
+                  logs={logs} 
+                  payments={payments}
+                  onAddPayment={(p) => setPayments(prev => [...prev, p])}
+              />;
+           case 'reports':
+               return <ReportsView 
+                   customers={customers} 
+                   payments={payments} 
+                   onUpdatePayment={handleUpdatePayment}
+                   onDeletePayment={handleDeletePayment}
+               />;
+          default:
+              return <div className="p-4">Not Found</div>;
+      }
+  };
 
   return (
     <Layout 
-      role={user.role} 
-      currentView={currentView} 
-      onChangeView={setCurrentView}
-      onLogout={handleLogout}
-      title={title}
+        role={user.role} 
+        currentView={view} 
+        onChangeView={(v) => { 
+            setView(v); 
+            // Reset customer form state when switching views
+            setShowCustomerForm(false);
+        }} 
+        onLogout={() => setUser(null)}
+        title={view === 'dashboard' ? 'Dashboard' : view.charAt(0).toUpperCase() + view.slice(1).replace('-', ' ')}
     >
-      {content}
+        {renderContent()}
+        
+        {/* Global Delete Confirmation Modal */}
+        <Modal 
+            isOpen={confirmModal.isOpen} 
+            onClose={closeConfirm} 
+            title={confirmModal.title}
+        >
+            <div className="flex flex-col items-center text-center space-y-4">
+                <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center">
+                    <ExclamationTriangleIcon className="w-8 h-8 text-red-500" />
+                </div>
+                <p className="text-gray-600">{confirmModal.message}</p>
+                
+                {/* Backup Button inside Confirmation */}
+                <Button variant="secondary" fullWidth onClick={handleBackup} className="mb-2">
+                    <ArrowDownTrayIcon className="w-5 h-5" /> Backup Data First
+                </Button>
+
+                <div className="flex gap-3 w-full">
+                    <Button variant="outline" fullWidth onClick={closeConfirm}>
+                        Cancel
+                    </Button>
+                    <Button variant="danger" fullWidth onClick={confirmModal.onConfirm}>
+                        Yes, Delete
+                    </Button>
+                </div>
+            </div>
+        </Modal>
     </Layout>
   );
 };
